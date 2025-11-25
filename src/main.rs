@@ -1,36 +1,73 @@
 use futures::lock::Mutex;
-use std::{collections::HashMap, sync::Arc};
-use tokio::net::{UnixSocket, UnixStream};
-use tokio::prelude::*;
+use std::{collections::HashMap, fmt::Display, sync::Arc};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixSocket, UnixStream},
+};
 use tracing::{debug, error, warn};
 
 struct MyCompositor {
     object_registry: HashMap<u32, WaylandObject>,
+    globals: Vec<(u32, WaylandObject, u32)>,
 }
 impl Default for MyCompositor {
     fn default() -> Self {
         let mut object_registry = HashMap::new();
         object_registry.insert(1, WaylandObject::Display);
-        object_registry.insert(2, WaylandObject::Registry);
-        MyCompositor { object_registry }
+        MyCompositor {
+            object_registry,
+            globals: vec![(1, WaylandObject::XdgWmBase, 7)],
+        }
     }
 }
 
+#[derive(Clone)]
 enum WaylandObject {
     Display,
     Registry,
     Callback,
+    XdgWmBase,
+}
+impl WaylandObject {
+    fn as_str(&self) -> &'static str {
+        match self {
+            WaylandObject::Display => "wl_display",
+            WaylandObject::Registry => "wl_registry",
+            WaylandObject::Callback => "wl_callback",
+            WaylandObject::XdgWmBase => "xdg_wm_base",
+        }
+    }
+}
+impl Display for WaylandObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
-fn get_message_bytes(object_id: u32, op_code: u16, args: &[u8], buffer: &mut [u8]) {
-    let object_id_bytes = object_id.to_le_bytes();
-    let op_code_bytes = op_code.to_le_bytes();
-    let length_bytes = (8 + args.len() as u16).to_le_bytes();
+async fn get_string_bytes(s: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(s.len() as u32 + 1).to_le_bytes());
+    bytes.extend_from_slice(s.as_bytes());
+    bytes.push(0);
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
+    }
+    bytes
+}
 
-    buffer[0..4].copy_from_slice(&object_id_bytes);
-    buffer[4..6].copy_from_slice(&op_code_bytes);
-    buffer[6..8].copy_from_slice(&length_bytes);
-    buffer[8..(8 + args.len())].copy_from_slice(args);
+async fn send_message(
+    stream: &mut UnixStream,
+    object_id: u32,
+    op_code: u16,
+    args: &[u8],
+) -> anyhow::Result<()> {
+    stream.write_all(&object_id.to_le_bytes()).await?;
+    stream.write_all(&op_code.to_le_bytes()).await?;
+    stream
+        .write_all(&(8 + args.len() as u16).to_le_bytes())
+        .await?;
+    stream.write_all(args).await?;
+    Ok(())
 }
 
 impl MyCompositor {
@@ -38,31 +75,47 @@ impl MyCompositor {
         &mut self,
         object_id: u32,
         op_code: u16,
-        message: &[u8],
+        arg_bytes: &[u8],
         stream: &mut UnixStream,
     ) -> anyhow::Result<()> {
         if let Some(object) = self.object_registry.get_mut(&object_id) {
             match object {
                 WaylandObject::Display => match op_code {
                     0 => {
-                        let new_id =
-                            u32::from_le_bytes([message[0], message[1], message[2], message[3]]);
+                        let new_id = u32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
                         debug!("Display sync called with new_id {}", new_id);
                         if stream.writable().await.is_err() {
                             error!("Failed to await writability on socket");
                         } else {
                             self.object_registry.insert(new_id, WaylandObject::Callback);
                             let argument_bytes = [0u8; 4];
-                            let mut response = [0u8; 12];
-                            get_message_bytes(new_id, 0, &argument_bytes, &mut response);
-
-                            stream.write_all(&response).await?;
+                            debug!("Sending callback done event for id {}", new_id);
+                            send_message(stream, new_id, 0, &argument_bytes).await?;
                         }
                     }
                     1 => {
-                        let new_id =
-                            u32::from_le_bytes([message[0], message[1], message[2], message[3]]);
+                        let new_id = u32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
                         debug!("Display get_registry called with new_id {}", new_id);
+                        if stream.writable().await.is_err() {
+                            error!("Failed to await writability on socket");
+                        } else {
+                            self.object_registry.insert(new_id, WaylandObject::Registry);
+                            for (name, interface, version) in &self.globals {
+                                let mut args = Vec::new();
+                                args.extend_from_slice(&name.to_le_bytes());
+
+                                let interface_bytes = get_string_bytes(interface.as_str()).await;
+                                args.extend_from_slice(&interface_bytes);
+                                args.extend_from_slice(&version.to_le_bytes());
+
+                                debug!(
+                                    "Sending global {} (interface: {}, version: {}) to registry id {}",
+                                    name, interface, version, new_id
+                                );
+
+                                send_message(stream, new_id, 0, &args).await?;
+                            }
+                        }
                     }
                     _ => {
                         warn!("Unknown op_code {} for Display", op_code);
@@ -70,21 +123,50 @@ impl MyCompositor {
                 },
                 WaylandObject::Registry => match op_code {
                     0 => {
-                        let name =
-                            u32::from_le_bytes([message[0], message[1], message[2], message[3]]);
-                        let new_id =
-                            u32::from_le_bytes([message[4], message[5], message[6], message[7]]);
-                        debug!(
-                            "Registry bind called with new_id {} and name {}",
-                            new_id, name
+                        let name = u32::from_le_bytes(arg_bytes[0..4].try_into().unwrap());
+                        let iface_len =
+                            u32::from_le_bytes(arg_bytes[4..8].try_into().unwrap()) as usize;
+                        let padded_len = (iface_len + 3) & !3;
+                        let interface =
+                            String::from_utf8(arg_bytes[8..8 + iface_len - 1].to_vec()).unwrap();
+
+                        let version = u32::from_le_bytes(
+                            arg_bytes[8 + padded_len..12 + padded_len]
+                                .try_into()
+                                .unwrap(),
                         );
+                        let new_id = u32::from_le_bytes(
+                            arg_bytes[12 + padded_len..16 + padded_len]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        debug!(
+                            "Registry bind called with name={}, new_id=({}::{}:{})",
+                            name, interface, version, new_id
+                        );
+
+                        if let Some((_, interface, version)) =
+                            self.globals.iter().find(|(n, _, _)| *n == name)
+                        {
+                            let object = interface.clone();
+                            self.object_registry.insert(new_id, object);
+                            debug!(
+                                "Bound new object id {} for interface {} version {}",
+                                new_id, interface, version
+                            );
+                        } else {
+                            warn!("No global found with name {}", name);
+                        }
                     }
                     _ => {
                         warn!("Unknown op_code {} for Registry", op_code);
                     }
                 },
                 WaylandObject::Callback => {
-                    warn!("No op_codes defined for Callback");
+                    warn!("No op_codes implemented for Callback");
+                }
+                WaylandObject::XdgWmBase => {
+                    warn!("No op_codes implemented for XdgWmBase");
                 }
             }
             Ok(())
@@ -122,56 +204,44 @@ async fn main() -> anyhow::Result<()> {
                     error!("Failed to await readability on socket");
                     return;
                 }
+
                 let mut buffer = [0u8; 8];
-                let mut total_read = 0;
-                while total_read < 8 {
-                    match stream.try_read(&mut buffer[total_read..]) {
-                        Ok(0) => {
-                            warn!("Connection closed by peer");
-                            return;
-                        }
-                        Ok(n) => {
-                            total_read += n;
-                        }
-                        Err(e) => {
-                            error!("Failed to read from socket: {}", e);
-                            return;
-                        }
+                match stream.read_exact(&mut buffer).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Connection closed or error while reading header: {}", e);
+                        return;
                     }
                 }
 
                 let object_id = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
                 let op_code = u16::from_le_bytes([buffer[4], buffer[5]]) as usize;
                 let message_length = u16::from_le_bytes([buffer[6], buffer[7]]);
-                debug!(
-                    "Object ID: {}, Message Length: {}, Op Code: {}",
-                    object_id, message_length, op_code
-                );
 
-                let mut message_buffer = vec![0u8; (message_length - 8) as usize];
-                let mut total_read = 0;
-                while total_read < message_buffer.len() {
-                    let _ = stream.readable().await;
-                    match stream.try_read(&mut message_buffer[total_read..]) {
-                        Ok(0) => {
-                            warn!("Connection closed while reading message");
-                            return;
-                        }
-                        Ok(n) => {
-                            total_read += n;
-                        }
-                        Err(e) => {
-                            error!("Failed to read message body: {}", e);
-                            return;
-                        }
+                let mut args_buffer = vec![0u8; (message_length - 8) as usize];
+
+                match stream.read_exact(&mut args_buffer).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            "Connection closed or error while reading message body: {}",
+                            e
+                        );
+                        return;
                     }
                 }
-                debug!("Received message body: {:?}", message_buffer);
 
                 let mut display = display_mutex.lock().await;
-                display
-                    .handle_message(object_id, op_code as u16, &message_buffer, &mut stream)
+                let res = display
+                    .handle_message(object_id, op_code as u16, &args_buffer, &mut stream)
                     .await;
+
+                if let Err(e) = res {
+                    error!("Error handling message: {}", e);
+                    error!("Closing connection due to error.");
+                    stream.shutdown().await.ok();
+                    return;
+                }
             }
         });
     }
