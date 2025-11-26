@@ -53,7 +53,7 @@ enum WaylandObject {
     Callback,
     Shm,
     Buffer(Buffer),
-    WlSurface,
+    WlSurface(Surface),
     WlRegion,
 }
 impl WaylandObject {
@@ -67,7 +67,7 @@ impl WaylandObject {
             WaylandObject::Shm => "wl_shm",
             WaylandObject::Buffer(_) => "wl_buffer",
             WaylandObject::WlCompositor => "wl_compositor",
-            WaylandObject::WlSurface => "wl_surface",
+            WaylandObject::WlSurface(_) => "wl_surface",
             WaylandObject::WlRegion => "wl_region",
         }
     }
@@ -78,9 +78,26 @@ impl Display for WaylandObject {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+#[repr(u32)]
 enum WlShmFormat {
+    #[default]
     Argb8888 = 0,
     Rgb888 = 0x34324752,
+}
+
+#[derive(Default, Clone, Copy)]
+#[repr(u32)]
+enum WlOutputTransform {
+    #[default]
+    Normal = 0,
+    Rotate90 = 1,
+    Rotate180 = 2,
+    Rotate270 = 3,
+    Flipped = 4,
+    Flipped90 = 5,
+    Flipped180 = 6,
+    Flipped270 = 7,
 }
 
 struct Buffer {
@@ -90,6 +107,27 @@ struct Buffer {
     stride: i32,
     format: u32,
     shm_pool: Arc<Mutex<MmapMut>>,
+}
+
+#[derive(Default)]
+struct Surface {
+    pending_buffer: Option<u32>,
+    current_buffer: Option<u32>,
+    pending_surface_damage: Vec<(i32, i32, i32, i32)>,
+    current_surface_damage: Vec<(i32, i32, i32, i32)>,
+    pending_buffer_damage: Vec<(i32, i32, i32, i32)>,
+    current_buffer_damage: Vec<(i32, i32, i32, i32)>,
+    pending_opaque_region: Option<u32>,
+    current_opaque_region: Option<u32>,
+    pending_input_region: Option<u32>,
+    current_input_region: Option<u32>,
+    pending_transform: WlOutputTransform,
+    current_transform: WlOutputTransform,
+    pending_scale: i32,
+    current_scale: i32,
+    pending_offset: (i32, i32),
+    current_offset: (i32, i32),
+    frame_callbacks: Vec<u32>,
 }
 
 async fn get_string_bytes(s: &str) -> Vec<u8> {
@@ -260,7 +298,7 @@ impl<'a> CompositorClientState<'a> {
                 WaylandObject::Shm => match op_code {
                     // wl_shm.create_pool(id:new_id<wl_sm_pool>, fd:fd, size:u32)
                     0 => {
-                        debug!("Creating shm pool");
+                        debug!("Shm.create_pool called");
                         let new_id = u32::from_le_bytes(arg_bytes[0..4].try_into().unwrap());
                         let size = i32::from_le_bytes(arg_bytes[4..8].try_into().unwrap());
                         let fd = fds.pop_front();
@@ -279,7 +317,7 @@ impl<'a> CompositorClientState<'a> {
                     }
                     // wl_shm.release()
                     1 => {
-                        debug!("Releasing shm pool");
+                        debug!("Shm.release called");
                         self.object_registry.remove(&object_id);
                     }
                     _ => {
@@ -342,7 +380,7 @@ impl<'a> CompositorClientState<'a> {
                         let new_id = u32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
                         debug!("WlCompositor.create_surface called with new_id {}", new_id);
                         self.object_registry
-                            .insert(new_id, WaylandObject::WlSurface);
+                            .insert(new_id, WaylandObject::WlSurface(Surface::default()));
                     }
                     // wl_compositor.create_region(id:new_id<wl_region>)
                     1 => {
@@ -355,9 +393,124 @@ impl<'a> CompositorClientState<'a> {
                     }
                 },
 
-                WaylandObject::WlSurface => {
-                    warn!("No op_codes implemented for WlSurface");
-                }
+                WaylandObject::WlSurface(surface) => match op_code {
+                    // wl_surface.destroy()
+                    0 => {
+                        debug!("WlSurface.destroy called");
+                        self.object_registry.remove(&object_id);
+                    }
+                    // wl_surface.attach(buffer:wl_buffer, x:int, y:int)
+                    1 => {
+                        let buffer_id = u32::from_le_bytes(arg_bytes[0..4].try_into().unwrap());
+                        let x = i32::from_le_bytes(arg_bytes[4..8].try_into().unwrap());
+                        let y = i32::from_le_bytes(arg_bytes[8..12].try_into().unwrap());
+
+                        debug!(
+                            "WlSurface.attach called with buffer_id {}, x {}, y {}",
+                            buffer_id, x, y
+                        );
+                        surface.pending_buffer = Some(buffer_id);
+                    }
+                    // wl_surface.damage(x:int, y:int, width:int, height:int)
+                    2 => {
+                        let x = i32::from_le_bytes(arg_bytes[0..4].try_into().unwrap());
+                        let y = i32::from_le_bytes(arg_bytes[4..8].try_into().unwrap());
+                        let width = i32::from_le_bytes(arg_bytes[8..12].try_into().unwrap());
+                        let height = i32::from_le_bytes(arg_bytes[12..16].try_into().unwrap());
+                        debug!(
+                            "WlSurface.damage called with x {}, y {}, width {}, height {}",
+                            x, y, width, height
+                        );
+                        surface.pending_surface_damage.push((x, y, width, height));
+                    }
+                    // wl_surface.frame(callback:new_id<wl_callback>)
+                    3 => {
+                        let new_id = u32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
+                        debug!("WlSurface.frame called with new_id {}", new_id);
+                        surface.frame_callbacks.push(new_id);
+                        self.object_registry.insert(new_id, WaylandObject::Callback);
+                    }
+                    // wl_surface.set_opaque_region(region:wl_region)
+                    4 => {
+                        let region_id = u32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
+                        debug!(
+                            "WlSurface.set_opaque_region called with region_id {}",
+                            region_id
+                        );
+                        surface.pending_opaque_region = Some(region_id);
+                    }
+                    // wl_surface.set_input_region(region:wl_region)
+                    5 => {
+                        let region_id = u32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
+                        debug!(
+                            "WlSurface.set_input_region called with region_id {}",
+                            region_id
+                        );
+                        surface.pending_input_region = Some(region_id);
+                    }
+                    // wl_surface.commit()
+                    6 => {
+                        debug!("WlSurface.commit called");
+                        surface.current_buffer = surface.pending_buffer.take();
+                        surface.current_surface_damage =
+                            std::mem::take(&mut surface.pending_surface_damage);
+                        surface.current_buffer_damage =
+                            std::mem::take(&mut surface.pending_buffer_damage);
+                        surface.current_opaque_region = surface.pending_opaque_region.take();
+                        surface.current_input_region = surface.pending_input_region.take();
+                        surface.current_transform = surface.pending_transform;
+                        surface.current_scale = surface.pending_scale;
+                        surface.current_offset = surface.pending_offset;
+
+                        // TODO: Rendering the surface would happen here
+                        // TODO: Maybe release the buffer?
+
+                        let callback_ids = surface.frame_callbacks.drain(..).collect::<Vec<u32>>();
+                        for callback_id in callback_ids {
+                            self.send_callback_done(callback_id, 0).await?;
+                        }
+                    }
+                    // wl_surface.set_buffer_transform(transform:i32)
+                    7 => {
+                        let transform = i32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
+                        debug!(
+                            "WlSurface.set_buffer_transform called with transform {}",
+                            transform
+                        );
+                        surface.pending_transform =
+                            unsafe { std::mem::transmute::<i32, WlOutputTransform>(transform) };
+                    }
+                    // wl_surface.set_buffer_scale(scale:i32)
+                    8 => {
+                        let scale = i32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
+                        debug!("WlSurface.set_buffer_scale called with scale {}", scale);
+                        surface.pending_scale = scale;
+                    }
+                    // wl_surface.damage_buffer(x:int, y:int, width:int, height:int)
+                    9 => {
+                        let x = i32::from_le_bytes(arg_bytes[0..4].try_into().unwrap());
+                        let y = i32::from_le_bytes(arg_bytes[4..8].try_into().unwrap());
+                        let width = i32::from_le_bytes(arg_bytes[8..12].try_into().unwrap());
+                        let height = i32::from_le_bytes(arg_bytes[12..16].try_into().unwrap());
+                        debug!(
+                            "WlSurface.damage_buffer called with x {}, y {}, width {}, height {}",
+                            x, y, width, height
+                        );
+                        surface.pending_buffer_damage.push((x, y, width, height));
+                    }
+                    // wl_surface.offset(x:int, y:int)
+                    10 => {
+                        let x = i32::from_le_bytes(arg_bytes[0..4].try_into().unwrap());
+                        let y = i32::from_le_bytes(arg_bytes[4..8].try_into().unwrap());
+                        debug!("WlSurface.offset called with x {}, y {}", x, y);
+
+                        surface.pending_offset = (x, y);
+                    }
+
+                    _ => {
+                        warn!("Unknown op_code {} for WlSurface", op_code);
+                    }
+                },
 
                 WaylandObject::WlRegion => {
                     warn!("No op_codes implemented for WlRegion");
@@ -411,8 +564,6 @@ async fn main() -> anyhow::Result<()> {
                 let mut buffer = [0u8; 4096];
                 let mut fds = [0; 10];
                 let result = client_state.stream.recv_with_fd(&mut buffer, &mut fds);
-
-                //let result = client_state.stream.read(&mut buffer).await.map(|n| (n, 0));
 
                 match result {
                     Ok((0, 0)) => {
