@@ -30,7 +30,8 @@ impl<'a> CompositorClientState<'a> {
         let new_id = u32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
         debug!("Display sync called with new_id {}", new_id);
 
-        self.object_registry.insert(new_id, WaylandObject::Callback);
+        self.object_registry
+            .insert(new_id, WaylandObject::WlCallback);
         self.send_callback_done(new_id, 0).await?;
         Ok(())
     }
@@ -42,7 +43,8 @@ impl<'a> CompositorClientState<'a> {
     ) -> anyhow::Result<()> {
         let new_id = u32::from_le_bytes(arg_bytes[..4].try_into().unwrap());
         debug!("Display get_registry called with new_id {}", new_id);
-        self.object_registry.insert(new_id, WaylandObject::Registry);
+        self.object_registry
+            .insert(new_id, WaylandObject::WlRegistry);
 
         for (name, interface, version) in &global_state.globals {
             self.send_global(new_id, *name, interface.as_str(), *version)

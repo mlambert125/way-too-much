@@ -48,7 +48,7 @@ impl<'a> CompositorClientState<'a> {
             let mmap = unsafe { MmapOptions::new().len(size as usize).map_mut(fd)? };
             self.object_registry.insert(
                 new_id,
-                WaylandObject::ShmPool(Arc::new(Mutex::new(mmap)), fd),
+                WaylandObject::WlShmPool(Arc::new(Mutex::new(mmap)), fd),
             );
         } else {
             anyhow::bail!("No file descriptor provided for shm pool creation");

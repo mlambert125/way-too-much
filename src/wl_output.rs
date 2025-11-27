@@ -18,7 +18,12 @@ pub enum WlOutputTransform {
 }
 
 impl<'a> CompositorClientState<'a> {
-    pub async fn handle_wl_output_message(&mut self, op_code: u16) -> anyhow::Result<()> {
+    pub async fn handle_wl_output_message(
+        &mut self,
+        object_id: u32,
+        op_code: u16,
+        arg_bytes: &[u8],
+    ) -> anyhow::Result<()> {
         warn!("Unknown op_code {} for wl_output", op_code);
         Ok(())
     }

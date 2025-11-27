@@ -151,7 +151,8 @@ impl<'a> CompositorClientState<'a> {
 
         debug!("WlSurface.frame called with new_id {}", new_id);
         surface.frame_callbacks.push(new_id);
-        self.object_registry.insert(new_id, WaylandObject::Callback);
+        self.object_registry
+            .insert(new_id, WaylandObject::WlCallback);
         Ok(())
     }
 

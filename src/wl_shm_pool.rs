@@ -18,7 +18,7 @@ impl<'a> CompositorClientState<'a> {
             .get(&object_id)
             .ok_or_else(|| anyhow::anyhow!("ShmPool object not found for id {}", object_id))?;
         let mmap = match shm_pool_object {
-            WaylandObject::ShmPool(mmap, _) => mmap,
+            WaylandObject::WlShmPool(mmap, _) => mmap,
             _ => {
                 anyhow::bail!("Object id {} is not a ShmPool", object_id);
             }
@@ -62,7 +62,7 @@ impl<'a> CompositorClientState<'a> {
             shm_pool: mmap.clone(),
         };
         self.object_registry
-            .insert(new_id, WaylandObject::Buffer(buffer));
+            .insert(new_id, WaylandObject::WlBuffer(buffer));
         Ok(())
     }
 

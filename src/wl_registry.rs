@@ -55,7 +55,7 @@ impl<'a> CompositorClientState<'a> {
             global_state.globals.iter().find(|(n, _, _)| *n == name)
         {
             let object = match interface {
-                WaylandObject::Shm => WaylandObject::Shm,
+                WaylandObject::WlShm => WaylandObject::WlShm,
                 WaylandObject::XdgWmBase => WaylandObject::XdgWmBase,
                 WaylandObject::WlCompositor => WaylandObject::WlCompositor,
                 _ => {
@@ -63,7 +63,7 @@ impl<'a> CompositorClientState<'a> {
                 }
             };
 
-            if let WaylandObject::Shm = object {
+            if let WaylandObject::WlShm = object {
                 self.send_format(new_id, WlShmFormat::Argb8888 as u32)
                     .await?;
                 self.send_format(new_id, WlShmFormat::Rgb888 as u32).await?;

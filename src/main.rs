@@ -34,7 +34,7 @@ impl Default for CompositorGlobalState {
     fn default() -> Self {
         CompositorGlobalState {
             globals: vec![
-                (1, WaylandObject::Shm, 1),
+                (1, WaylandObject::WlShm, 1),
                 (2, WaylandObject::WlCompositor, 6),
                 (3, WaylandObject::XdgWmBase, 7),
             ],
@@ -49,7 +49,7 @@ struct CompositorClientState<'a> {
 impl<'a> CompositorClientState<'a> {
     fn new(stream: &'a mut UnixStream) -> Self {
         let mut object_registry = HashMap::new();
-        object_registry.insert(1, WaylandObject::Display);
+        object_registry.insert(1, WaylandObject::WlDisplay);
         CompositorClientState {
             object_registry,
             stream,
@@ -58,16 +58,16 @@ impl<'a> CompositorClientState<'a> {
 }
 
 enum WaylandObject {
-    Display,
-    Registry,
+    WlDisplay,
+    WlRegistry,
 
     XdgWmBase,
-    ShmPool(Arc<Mutex<MmapMut>>, i32),
+    WlShmPool(Arc<Mutex<MmapMut>>, i32),
     WlCompositor,
 
-    Callback,
-    Shm,
-    Buffer(BufferState),
+    WlCallback,
+    WlShm,
+    WlBuffer(BufferState),
     WlSurface(SurfaceState),
     WlRegion,
     WlOutput,
@@ -75,13 +75,13 @@ enum WaylandObject {
 impl WaylandObject {
     fn as_str(&self) -> &'static str {
         match self {
-            WaylandObject::Display => "wl_display",
-            WaylandObject::Registry => "wl_registry",
-            WaylandObject::Callback => "wl_callback",
+            WaylandObject::WlDisplay => "wl_display",
+            WaylandObject::WlRegistry => "wl_registry",
+            WaylandObject::WlCallback => "wl_callback",
             WaylandObject::XdgWmBase => "xdg_wm_base",
-            WaylandObject::ShmPool(_, _) => "wl_shm_pool",
-            WaylandObject::Shm => "wl_shm",
-            WaylandObject::Buffer(_) => "wl_buffer",
+            WaylandObject::WlShmPool(_, _) => "wl_shm_pool",
+            WaylandObject::WlShm => "wl_shm",
+            WaylandObject::WlBuffer(_) => "wl_buffer",
             WaylandObject::WlCompositor => "wl_compositor",
             WaylandObject::WlSurface(_) => "wl_surface",
             WaylandObject::WlRegion => "wl_region",
@@ -125,24 +125,24 @@ impl<'a> CompositorClientState<'a> {
     ) -> anyhow::Result<()> {
         if let Some(object) = self.object_registry.get_mut(&object_id) {
             match object {
-                WaylandObject::Display => {
+                WaylandObject::WlDisplay => {
                     self.handle_wl_display_message(op_code, arg_bytes, global_state)
                         .await?;
                 }
-                WaylandObject::Registry => {
+                WaylandObject::WlRegistry => {
                     self.handle_wl_registry_message(op_code, arg_bytes, global_state)
                         .await?
                 }
-                WaylandObject::Callback => self.handle_wl_callback_message(op_code).await?,
-                WaylandObject::Shm => {
+                WaylandObject::WlCallback => self.handle_wl_callback_message(op_code).await?,
+                WaylandObject::WlShm => {
                     self.handle_wl_shm_message(object_id, op_code, arg_bytes, fds)
                         .await?
                 }
-                WaylandObject::ShmPool(_mmap, _fd) => {
+                WaylandObject::WlShmPool(_mmap, _fd) => {
                     self.handle_wl_shm_pool_message(object_id, op_code, arg_bytes)
                         .await?
                 }
-                WaylandObject::Buffer(_buffer_data) => {
+                WaylandObject::WlBuffer(_buffer_data) => {
                     self.handle_wl_buffer_message(object_id, op_code).await?
                 }
 
@@ -157,15 +157,18 @@ impl<'a> CompositorClientState<'a> {
                 }
 
                 WaylandObject::WlRegion => {
-                    warn!("No op_codes implemented for WlRegion");
+                    self.handle_wl_region_message(object_id, op_code, arg_bytes)
+                        .await?
                 }
 
                 WaylandObject::XdgWmBase => {
-                    warn!("No op_codes implemented for XdgWmBase");
+                    self.handle_xdg_wm_base_message(object_id, op_code, arg_bytes)
+                        .await?
                 }
 
                 WaylandObject::WlOutput => {
-                    warn!("No op_codes implemented for WlOutput");
+                    self.handle_wl_output_message(object_id, op_code, arg_bytes)
+                        .await?
                 }
             }
             Ok(())
@@ -219,7 +222,6 @@ async fn main() -> anyhow::Result<()> {
                         return;
                     }
                     Ok((data_read, fds_read)) => {
-                        debug!("Read {} bytes and {} fds", data_read, fds_read);
                         for byte in &buffer[..data_read] {
                             data.push_back(*byte);
                         }
