@@ -625,7 +625,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "way-too-much"
+name = "way-too-far"
 version = "0.1.0"
 dependencies = [
  "anyhow",
